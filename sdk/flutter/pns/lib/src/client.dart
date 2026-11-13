@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// Client for the Devstroop Push service.
 class PnsClient {
@@ -77,10 +79,6 @@ class PnsClient {
   }
 }
 
-
-import 'dart:async';
-import 'dart:convert';
-import 'package:web_socket_channel/web_socket_channel.dart';
 
 extension PnsRealtime on PnsClient {
   Stream<Map<String, dynamic>> connect({required String token}) {
