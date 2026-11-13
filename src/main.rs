@@ -277,6 +277,21 @@ async fn publish(
                         let payload = json!({"title": body.title, "body": body.body, "data": body.data});
                         let _ = http.post(endpoint).json(&payload).send().await;
                     }
+                } else if dev.get("transport").and_then(|v| v.as_str()) == Some("fcm") {
+                    if let Some(token) = dev.get("token").and_then(|v| v.as_str()) {
+                        if let Ok(key) = std::env::var("FCM_SERVER_KEY") {
+                            let payload = json!({
+                                "to": token,
+                                "notification": {"title": body.title, "body": body.body},
+                                "data": {"data": body.data},
+                            });
+                            let _ = http.post("https://fcm.googleapis.com/fcm/send")
+                                .header("Authorization", format!("key={key}"))
+                                .json(&payload)
+                                .send()
+                                .await;
+                        }
+                    }
                 }
             }
         }
