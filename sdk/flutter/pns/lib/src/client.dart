@@ -76,3 +76,24 @@ class PnsClient {
     return list.whereType<Map>().map(Map<String, dynamic>.from).toList();
   }
 }
+
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+extension PnsRealtime on PnsClient {
+  Stream<Map<String, dynamic>> connect({required String token}) {
+    final wsUrl = baseUrl.replaceFirst('http', 'ws');
+    final channel = WebSocketChannel.connect(Uri.parse('$wsUrl/ws?token=$token'));
+    return channel.stream.map((event) {
+      try {
+        if (event is String) {
+          final decoded = jsonDecode(event);
+          if (decoded is Map) return Map<String, dynamic>.from(decoded);
+        }
+      } catch (_) {}
+      return <String, dynamic>{'raw': event.toString()};
+    });
+  }
+}
