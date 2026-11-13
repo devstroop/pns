@@ -136,6 +136,7 @@ impl PushService for PushSvc {
                 })),
             })).await;
 
+            let mut last_id = "0".to_string();
             loop {
                 let mut read_conn = match redis::Client::open(redis_url.as_str()) {
                     Ok(c) => match c.get_async_connection().await {
@@ -148,7 +149,7 @@ impl PushService for PushSvc {
                 let result: redis::RedisResult<redis::Value> = redis::cmd("XREAD")
                     .arg("BLOCK").arg(1000)
                     .arg("COUNT").arg(10)
-                    .arg("STREAMS").arg(&key).arg("$")
+                    .arg("STREAMS").arg(&key).arg(&last_id)
                     .query_async(&mut read_conn)
                     .await;
 
@@ -202,6 +203,12 @@ impl PushService for PushSvc {
 
                 while let Ok(Some(res)) = inbound.try_next().await {
                     let msg = res;
+                    if let Some(push::client_message::Payload::Ack(ack)) = &msg.payload {
+                        let mut c = match redis::Client::open(redis_url.as_str()) { Ok(c) => c, Err(_) => continue };
+                        if let Ok(mut conn) = c.get_async_connection().await {
+                            let _: () = redis::cmd("XDEL").arg(&key).arg(&ack.notification_id).query_async(&mut conn).await.unwrap_or(());
+                        }
+                    }
                     if let Some(push::client_message::Payload::Ping(_)) = msg.payload {
                         let _ = tx.send(Ok(ServerMessage {
                             payload: Some(push::server_message::Payload::Pong(Pong {})),
@@ -248,6 +255,7 @@ async fn publish(
     let key_name = stream_key(&body.user_id);
     let id: String = redis::cmd("XADD")
         .arg(&key_name)
+        .arg("MAXLEN").arg("~").arg(1000)
         .arg("*")
         .arg("title").arg(&body.title)
         .arg("body").arg(&body.body)
