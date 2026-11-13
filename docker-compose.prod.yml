@@ -1,0 +1,34 @@
+name: pns
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - pns-redis:/data
+    networks:
+      - pns
+
+  pns:
+    image: ghcr.io/devstroop/pns:${IMAGE_TAG:?set IMAGE_TAG}
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      PUSH_API_KEY: ${PUSH_API_KEY:?set PUSH_API_KEY}
+    networks:
+      - pns
+      - 1km_default
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=1km_default
+      - traefik.http.services.pns.loadbalancer.server.port=8080
+    depends_on:
+      - redis
+
+networks:
+  pns:
+  1km_default:
+    external: true
+
+volumes:
+  pns-redis:
