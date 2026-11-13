@@ -357,6 +357,55 @@ async fn list_devices(
     }
 }
 
+
+async fn poll(
+    Path(user_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let client = match redis::Client::open(redis_url().as_str()) {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "redis"}))),
+    };
+    let mut conn = match client.get_async_connection().await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "redis"}))),
+    };
+    let key = stream_key(&user_id);
+    let result: redis::RedisResult<redis::Value> = redis::cmd("XRANGE")
+        .arg(&key).arg("-").arg("+")
+        .query_async(&mut conn).await;
+    let mut items = Vec::new();
+    if let Ok(redis::Value::Array(streams)) = result {
+        // XRANGE returns array of [id, [field, value, ...]]
+        for entry in streams {
+            if let redis::Value::Array(fields) = entry {
+                if fields.is_empty() { continue; }
+                let id = match &fields[0] { redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(), _ => continue };
+                let mut title = String::new();
+                let mut body = String::new();
+                let mut data = String::new();
+                if fields.len() > 1 {
+                    if let redis::Value::Array(kv) = &fields[1] {
+                        let mut i = 0;
+                        while i + 1 < kv.len() {
+                            let k = match &kv[i] { redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(), _ => String::new() };
+                            let v = match &kv[i+1] { redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(), _ => String::new() };
+                            match k.as_str() {
+                                "title" => title = v,
+                                "body" => body = v,
+                                "data" => data = v,
+                                _ => {}
+                            }
+                            i += 2;
+                        }
+                    }
+                }
+                items.push(json!({"id": id, "title": title, "body": body, "data": data}));
+            }
+        }
+    }
+    (StatusCode::OK, Json(json!({"ok": true, "notifications": items})))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -373,7 +422,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/push", post(publish))
-        .route("/devices", post(register_device).get(list_devices));
+        .route("/devices", post(register_device).get(list_devices))
+        .route("/poll/{user_id}", get(poll));
     let http = async {
         let listener = TcpListener::bind(http_addr).await?;
         axum::serve(listener, app).await
