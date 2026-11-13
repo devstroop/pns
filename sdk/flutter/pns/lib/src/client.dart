@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 /// Client for the Devstroop Push service.
-class DevstroopPush {
+class PnsClient {
   DevstroopPush({required this.baseUrl, this.apiKey});
 
   final String baseUrl;
