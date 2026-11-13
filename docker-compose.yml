@@ -1,0 +1,15 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  push:
+    build: .
+    environment:
+      REDIS_URL: redis://redis:6379
+      PUSH_API_KEY: dev-key
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    depends_on:
+      - redis
