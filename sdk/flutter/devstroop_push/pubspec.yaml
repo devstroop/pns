@@ -1,4 +1,4 @@
-name: devstroop_push
+name: pns
 description: Client SDK for Devstroop Push notification service.
 version: 0.1.0
 environment:

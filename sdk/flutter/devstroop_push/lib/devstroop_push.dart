@@ -1,3 +1,3 @@
-library devstroop_push;
+library pns;
 
 export 'src/client.dart';
