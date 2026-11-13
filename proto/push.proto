@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package devstroop.push.v1;
+
+service PushService {
+  // Client opens a bidirectional stream for real-time delivery.
+  rpc Stream (stream ClientMessage) returns (stream ServerMessage);
+}
+
+message ClientMessage {
+  string token = 1;
+  oneof payload {
+    Ack ack = 2;
+    Ping ping = 3;
+  }
+}
+
+message Ack {
+  string notification_id = 1;
+}
+
+message Ping {}
+
+message ServerMessage {
+  oneof payload {
+    Notification notification = 1;
+    Pong pong = 2;
+  }
+}
+
+message Notification {
+  string id = 1;
+  string title = 2;
+  string body = 3;
+  string data = 4;
+  int64 created_at = 5;
+}
+
+message Pong {}
