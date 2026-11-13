@@ -3,7 +3,7 @@ import 'package:http/http.dart' as http;
 
 /// Client for the Devstroop Push service.
 class PnsClient {
-   PnsClient({required this.baseUrl, this.apiKey});
+  PnsClient({required this.baseUrl, this.apiKey});
 
   final String baseUrl;
   final String? apiKey;

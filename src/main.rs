@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::{
     Router, Json,
     routing::{get, post, delete},
-    extract::{Path, Query},
+    extract::{Path, Query, ws::{WebSocket, WebSocketUpgrade}},
     http::{HeaderMap, StatusCode},
 };
 use redis::aio::ConnectionManager;
@@ -406,6 +406,100 @@ async fn poll(
     (StatusCode::OK, Json(json!({"ok": true, "notifications": items})))
 }
 
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    let token = params.get("token").cloned().unwrap_or_default();
+    ws.on_upgrade(move |socket| ws_loop(socket, token))
+}
+
+async fn ws_loop(mut socket: WebSocket, token: String) {
+    use axum::extract::ws::Message;
+    use futures::SinkExt;
+
+    // Auth
+    let redis_url = redis_url();
+    let mut conn = match redis::Client::open(redis_url.as_str()) {
+        Ok(c) => match c.get_async_connection().await {
+            Ok(c) => c,
+            Err(_) => { let _ = socket.send(Message::Text("auth failed".into())).await; return; }
+        },
+        Err(_) => { let _ = socket.send(Message::Text("auth failed".into())).await; return; }
+    };
+    let session: Option<String> = redis::cmd("GET")
+        .arg(format!("NS:{token}"))
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(None);
+    let Some(session) = session else {
+        let _ = socket.send(Message::Text("unauthorized".into())).await;
+        return;
+    };
+    let user_id = session.split(':').nth(1).unwrap_or(&session).to_string();
+    let key = stream_key(&user_id);
+
+    let welcome = serde_json::json!({"type":"notification","id":"welcome","title":"Connected","body":session});
+    let _ = socket.send(Message::Text(welcome.to_string())).await;
+
+    let mut last_id = "0".to_string();
+    loop {
+        // Read from Redis stream (blocking)
+        let mut read_conn = match redis::Client::open(redis_url.as_str()) {
+            Ok(c) => match c.get_async_connection().await { Ok(c) => c, Err(_) => break },
+            Err(_) => break,
+        };
+        let result: redis::RedisResult<redis::Value> = redis::cmd("XREAD")
+            .arg("BLOCK").arg(1000)
+            .arg("COUNT").arg(10)
+            .arg("STREAMS").arg(&key).arg(&last_id)
+            .query_async(&mut read_conn)
+            .await;
+        if let Ok(redis::Value::Array(streams)) = result {
+            for stream in streams {
+                if let redis::Value::Array(entries) = stream {
+                    if entries.len() >= 2 {
+                        if let redis::Value::Array(msgs) = &entries[1] {
+                            for msg in msgs {
+                                if let redis::Value::Array(fields) = msg {
+                                    if fields.is_empty() { continue; }
+                                    let id = match &fields[0] { redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(), _ => continue };
+                                    let mut title = String::new();
+                                    let mut body = String::new();
+                                    let mut data = String::new();
+                                    if fields.len() > 1 {
+                                        if let redis::Value::Array(kv) = &fields[1] {
+                                            let mut i = 0;
+                                            while i + 1 < kv.len() {
+                                                let k = match &kv[i] { redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(), _ => String::new() };
+                                                let v = match &kv[i+1] { redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(), _ => String::new() };
+                                                match k.as_str() {
+                                                    "title" => title = v,
+                                                    "body" => body = v,
+                                                    "data" => data = v,
+                                                    _ => {}
+                                                }
+                                                i += 2;
+                                            }
+                                        }
+                                    }
+                                    let payload = serde_json::json!({"type":"notification","id":id,"title":title,"body":body,"data":data});
+                                    if socket.send(Message::Text(payload.to_string())).await.is_err() { return; }
+                                    last_id = id;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // handle incoming messages (ping/ack) non-blocking
+        // axum ws: try recv
+        // We'll skip for MVP.
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -423,7 +517,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/push", post(publish))
         .route("/devices", post(register_device).get(list_devices))
-        .route("/poll/{user_id}", get(poll));
+        .route("/poll/{user_id}", get(poll))
+        .route("/ws", get(ws_handler));
     let http = async {
         let listener = TcpListener::bind(http_addr).await?;
         axum::serve(listener, app).await
