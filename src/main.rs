@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     Router, Json,
@@ -24,6 +25,10 @@ use push::{
     push_service_server::{PushService, PushServiceServer},
     ClientMessage, ServerMessage, Pong,
 };
+
+static NOTIFICATIONS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static DEVICES_REGISTERED: AtomicU64 = AtomicU64::new(0);
+static STREAMS_CONNECTED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct PushSvc {
@@ -125,6 +130,7 @@ impl PushService for PushSvc {
             let key = stream_key(&user_id);
 
             tracing::info!("client authenticated: {session}, stream={key}");
+            STREAMS_CONNECTED.fetch_add(1, Ordering::Relaxed);
 
             let _ = tx.send(Ok(ServerMessage {
                 payload: Some(push::server_message::Payload::Notification(push::Notification {
@@ -297,6 +303,7 @@ async fn publish(
         }
     }
 
+    NOTIFICATIONS_PUBLISHED.fetch_add(1, Ordering::Relaxed);
     (StatusCode::CREATED, Json(json!({"ok": true, "id": id})))
 }
 
@@ -335,6 +342,7 @@ async fn register_device(
         .await
         .unwrap_or(());
 
+    DEVICES_REGISTERED.fetch_add(1, Ordering::Relaxed);
     (StatusCode::CREATED, Json(json!({"ok": true, "device_id": device_id})))
 }
 
@@ -500,6 +508,17 @@ async fn ws_loop(mut socket: WebSocket, token: String) {
     }
 }
 
+
+async fn metrics() -> (StatusCode, String) {
+    let body = format!(
+        "# TYPE pns_notifications_published counter\npns_notifications_published {}\n# TYPE pns_devices_registered counter\npns_devices_registered {}\n# TYPE pns_streams_connected counter\npns_streams_connected {}\n",
+        NOTIFICATIONS_PUBLISHED.load(Ordering::Relaxed),
+        DEVICES_REGISTERED.load(Ordering::Relaxed),
+        STREAMS_CONNECTED.load(Ordering::Relaxed),
+    );
+    (StatusCode::OK, body)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -518,7 +537,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/push", post(publish))
         .route("/devices", post(register_device).get(list_devices))
         .route("/poll/{user_id}", get(poll))
-        .route("/ws", get(ws_handler));
+        .route("/ws", get(ws_handler))
+        .route("/metrics", get(metrics));
     let http = async {
         let listener = TcpListener::bind(http_addr).await?;
         axum::serve(listener, app).await
