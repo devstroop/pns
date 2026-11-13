@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use axum::{
     Router, Json,
-    routing::{get, post},
+    routing::{get, post, delete},
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
 use redis::aio::ConnectionManager;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -37,6 +39,20 @@ struct PushBody {
     data: String,
 }
 
+#[derive(Deserialize)]
+struct DeviceBody {
+    user_id: String,
+    platform: String,
+    transport: String,
+    endpoint: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListDevicesQuery {
+    user_id: String,
+}
+
 #[derive(Serialize)]
 struct PushResponse {
     ok: bool,
@@ -55,6 +71,10 @@ fn stream_key(user_id: &str) -> String {
     format!("N{user_id}0")
 }
 
+fn devices_key(user_id: &str) -> String {
+    format!("devices:{user_id}")
+}
+
 #[tonic::async_trait]
 impl PushService for PushSvc {
     type StreamStream = tokio_stream::wrappers::ReceiverStream<Result<ServerMessage, Status>>;
@@ -68,7 +88,6 @@ impl PushService for PushSvc {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
-            // Auth: first message must carry token.
             let token = match inbound.next().await {
                 Some(Ok(m)) if !m.token.is_empty() => m.token,
                 _ => {
@@ -102,7 +121,6 @@ impl PushService for PushSvc {
                 return;
             };
 
-            // session is "{tenant}:{userId}" — use userId for stream key.
             let user_id = session.split(':').nth(1).unwrap_or(&session).to_string();
             let key = stream_key(&user_id);
 
@@ -118,11 +136,7 @@ impl PushService for PushSvc {
                 })),
             })).await;
 
-            // Delivery loop: blocking XREAD for new entries.
-            let mut last_id = "$".to_string();
             loop {
-                // Check for client messages (ping/ack) without blocking forever.
-                // We use a short timeout read.
                 let mut read_conn = match redis::Client::open(redis_url.as_str()) {
                     Ok(c) => match c.get_async_connection().await {
                         Ok(c) => c,
@@ -134,14 +148,13 @@ impl PushService for PushSvc {
                 let result: redis::RedisResult<redis::Value> = redis::cmd("XREAD")
                     .arg("BLOCK").arg(1000)
                     .arg("COUNT").arg(10)
-                    .arg("STREAMS").arg(&key).arg(&last_id)
+                    .arg("STREAMS").arg(&key).arg("$")
                     .query_async(&mut read_conn)
                     .await;
 
                 if let Ok(redis::Value::Array(streams)) = result {
                     for stream in streams {
                         if let redis::Value::Array(entries) = stream {
-                            // entries: [stream_name, [ [id, [field, value, ...]], ... ]]
                             if entries.len() >= 2 {
                                 if let redis::Value::Array(msgs) = &entries[1] {
                                     for msg in msgs {
@@ -151,7 +164,6 @@ impl PushService for PushSvc {
                                                 redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
                                                 _ => continue,
                                             };
-                                            // parse fields
                                             let mut title = String::new();
                                             let mut body = String::new();
                                             let mut data = String::new();
@@ -180,7 +192,6 @@ impl PushService for PushSvc {
                                                     created_at: chrono_now(),
                                                 })),
                                             })).await;
-                                            last_id = id;
                                         }
                                     }
                                 }
@@ -189,7 +200,6 @@ impl PushService for PushSvc {
                     }
                 }
 
-                // Drain inbound pings/acks (non-blocking).
                 while let Ok(Some(res)) = inbound.try_next().await {
                     let msg = res;
                     if let Some(push::client_message::Payload::Ping(_)) = msg.payload {
@@ -197,7 +207,7 @@ impl PushService for PushSvc {
                             payload: Some(push::server_message::Payload::Pong(Pong {})),
                         })).await;
                     }
-                    // TODO: ack -> XDEL
+                    // TODO: ack -> XDEL stream entry
                 }
             }
         });
@@ -219,10 +229,11 @@ async fn publish(
     headers: HeaderMap,
     Json(body): Json<PushBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // API key check.
-    let key = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
-    if !api_key().is_empty() && key != api_key() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"ok": false, "error": "unauthorized"})));
+    if !api_key().is_empty() {
+        let key = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if key != api_key() {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"ok": false, "error": "unauthorized"})));
+        }
     }
 
     let client = match redis::Client::open(redis_url().as_str()) {
@@ -245,7 +256,82 @@ async fn publish(
         .await
         .unwrap_or_default();
 
+    // UnifiedPush fan-out (best-effort).
+    let http = Client::new();
+    let devices_key = devices_key(&body.user_id);
+    let devices: redis::RedisResult<std::collections::HashMap<String, String>> =
+        redis::cmd("HGETALL").arg(&devices_key).query_async(&mut conn).await;
+    if let Ok(devs) = devices {
+        for (_id, val) in devs {
+            if let Ok(dev) = serde_json::from_str::<serde_json::Value>(&val) {
+                if dev.get("transport").and_then(|v| v.as_str()) == Some("unified_push") {
+                    if let Some(endpoint) = dev.get("endpoint").and_then(|v| v.as_str()) {
+                        let payload = json!({"title": body.title, "body": body.body, "data": body.data});
+                        let _ = http.post(endpoint).json(&payload).send().await;
+                    }
+                }
+            }
+        }
+    }
+
     (StatusCode::CREATED, Json(json!({"ok": true, "id": id})))
+}
+
+async fn register_device(
+    headers: HeaderMap,
+    Json(body): Json<DeviceBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !api_key().is_empty() {
+        let key = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if key != api_key() {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"ok": false, "error": "unauthorized"})));
+        }
+    }
+
+    let client = match redis::Client::open(redis_url().as_str()) {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "redis"}))),
+    };
+    let mut conn = match client.get_async_connection().await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "redis"}))),
+    };
+
+    let device_id = format!("{}-{}", body.platform, body.transport);
+    let val = json!({
+        "platform": body.platform,
+        "transport": body.transport,
+        "endpoint": body.endpoint,
+        "token": body.token,
+    });
+    let _: () = redis::cmd("HSET")
+        .arg(devices_key(&body.user_id))
+        .arg(&device_id)
+        .arg(val.to_string())
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(());
+
+    (StatusCode::CREATED, Json(json!({"ok": true, "device_id": device_id})))
+}
+
+async fn list_devices(
+    Query(q): Query<ListDevicesQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let client = match redis::Client::open(redis_url().as_str()) {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "redis"}))),
+    };
+    let mut conn = match client.get_async_connection().await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "redis"}))),
+    };
+    let devices: redis::RedisResult<std::collections::HashMap<String, String>> =
+        redis::cmd("HGETALL").arg(devices_key(&q.user_id)).query_async(&mut conn).await;
+    match devices {
+        Ok(d) => (StatusCode::OK, Json(json!({"ok": true, "devices": d}))),
+        Err(_) => (StatusCode::OK, Json(json!({"ok": true, "devices": {}}))),
+    }
 }
 
 #[tokio::main]
@@ -263,7 +349,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/push", post(publish));
+        .route("/push", post(publish))
+        .route("/devices", post(register_device).get(list_devices));
     let http = async {
         let listener = TcpListener::bind(http_addr).await?;
         axum::serve(listener, app).await
