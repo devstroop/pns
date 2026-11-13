@@ -544,6 +544,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         axum::serve(listener, app).await
     };
 
+    // Background cleanup: trim notification streams periodically.
+    let cleanup_url = redis_url();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if let Ok(client) = redis::Client::open(cleanup_url.as_str()) {
+                if let Ok(mut conn) = client.get_async_connection().await {
+                    // Scan for stream keys N*
+                    let mut cursor: u64 = 0;
+                    loop {
+                        let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                            .arg(cursor)
+                            .arg("MATCH").arg("N*")
+                            .arg("COUNT").arg(100)
+                            .query_async(&mut conn)
+                            .await
+                            .unwrap_or((0, vec![]));
+                        for key in keys {
+                            let _: () = redis::cmd("XTRIM")
+                                .arg(&key)
+                                .arg("MAXLEN").arg("~").arg(1000)
+                                .query_async(&mut conn)
+                                .await
+                                .unwrap_or(());
+                        }
+                        cursor = new_cursor;
+                        if cursor == 0 { break; }
+                    }
+                }
+            }
+        }
+    });
+
     tracing::info!("devstroop-push listening gRPC :50051, HTTP :8080");
     tokio::select! {
         r = grpc => r?,
